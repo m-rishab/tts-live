@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_from_directory
 from flask_socketio import SocketIO, emit
 import os
 import logging
@@ -41,7 +41,7 @@ MEMORY_CHECK_INTERVAL = 60
 SPEAKERS_FOLDER = "speakers"
 UPLOAD_FOLDER = "uploads"
 TEMPLATE_FOLDER = "templates"
-MIN_SENTENCE_LENGTH = 1
+MIN_SENTENCE_LENGTH = 1  # Changed to 1 to allow shorter inputs
 
 # Create Flask app and SocketIO instance
 app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
@@ -104,6 +104,7 @@ def process_dates(text):
             day_str = f"{day_num}{'th' if 11 <= day_num <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day_num % 10, 'th')}"
             month_str = date.strftime("%B")
             year = date.year
+            # Adjust for two-digit years
             if year < 100:
                 year += 2000 if year <= 24 else 1900  # Adjust this threshold as needed
             year_str = num2words(year)
@@ -124,21 +125,26 @@ def preprocess_text(text):
         return ""
     
     try:
+        # Existing preprocessing steps
         text = re.sub(r'<original_message>.*?</original_message>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<[^>]+>', '', text)
         text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<function_name>.*?</function_name>', '', text)
+        text = re.sub(r'<function_name>.*?</function_name>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<[^>]+>', '', text)
         text = re.sub(r'\b(end_call|start_call|function_name)\b', '', text, flags=re.IGNORECASE)
+        
+        # New step: Remove {prompt} and {response} placeholders
         text = re.sub(r'\{prompt\}|\{response\}', '', text)
+        
         text = process_dates(text)
         text = remove_special_characters(text)
         text = normalize_text(text)
+        
         return text.strip()
     except Exception as e:
         logger.error(f"Error in preprocess_text: {e}")
         return ""
-
+    
 def process_text(text, speaker_wav, language):
     try:
         logger.info(f"Starting process_text with text: '{text}', language: {language}")
@@ -185,118 +191,83 @@ def index():
 
 @app.route('/speakers/')
 def get_speakers():
-    speakers = [os.path.splitext(f)[0] for f in os.listdir(SPEAKERS_FOLDER) if f.endswith('.wav')]
-    return jsonify(speakers)
+    speaker_files = os.listdir(SPEAKERS_FOLDER)
+    return jsonify(speaker_files)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'speakerFile' not in request.files:
-        return 'No file part', 400
+@app.route('/download/<filename>')
+def download_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename, as_attachment=True)
 
-    file = request.files['speakerFile']
-    if file.filename == '':
-        return 'No selected file', 400
+@app.route('/process_audio/', methods=['POST'])
+def process_audio():
+    file = request.files['file']
+    language = request.form.get('language', 'en')
+    text = request.form.get('text', '')
 
-    language = request.form.get('language')
-    if not language:
-        return 'No language specified', 400
+    if file:
+        filename = secure_filename(file.filename)
+        speaker_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(speaker_path)
+        
+        audio_array, processing_time, real_time_factor = process_text(text, speaker_path, language)
+        
+        output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'output.wav')
+        sf.write(output_path, audio_array, SAMPLE_RATE)
+        
+        return send_from_directory(app.config['UPLOAD_FOLDER'], 'output.wav', as_attachment=True)
+    
+    return 'File not found', 400
 
-    os.makedirs(SPEAKERS_FOLDER, exist_ok=True)
-    file_path = os.path.join(SPEAKERS_FOLDER, secure_filename(file.filename))
-    file.save(file_path)
-    return jsonify({'message': 'File uploaded successfully', 'speaker_file': file.filename}), 200
+@app.route('/play_audio/', methods=['POST'])
+def play_audio():
+    global paused
+    paused = False
+    emit('play', broadcast=True)
+    return 'Playing audio'
+
+@app.route('/pause_audio/', methods=['POST'])
+def pause_audio():
+    global paused
+    paused = True
+    emit('pause', broadcast=True)
+    return 'Pausing audio'
+
+@app.route('/resume_audio/', methods=['POST'])
+def resume_audio():
+    global paused
+    paused = False
+    emit('resume', broadcast=True)
+    return 'Resuming audio'
+
+@app.route('/stop_audio/', methods=['POST'])
+def stop_audio():
+    global paused
+    paused = True
+    emit('stop', broadcast=True)
+    return 'Stopping audio'
 
 @socketio.on('connect')
 def handle_connect():
-    emit('response', {'message': 'Connected to server'})
+    emit('status', {'message': 'Connected'})
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    logger.info('Client disconnected')
+    emit('status', {'message': 'Disconnected'})
 
 @socketio.on('message')
-def handle_message(data):
-    global text_buffer, paused, sentence_queue, correction_flag, last_processed_text
-    try:
-        logger.info(f"Received message: {data}")
-        new_text = data['text']
-        language = data['language']
-        speaker_wav = data['speaker_wav']
+def handle_message(message):
+    global text_buffer, paused
+    if not paused:
+        text_buffer += message
+        emit('message', {'message': message}, broadcast=True)
 
-        if not speaker_wav:
-            raise ValueError("No speaker file selected")
-
-        speaker_wav_path = os.path.join(SPEAKERS_FOLDER, f"{speaker_wav}.wav")
-        if not os.path.exists(speaker_wav_path):
-            raise FileNotFoundError(f"Speaker file not found: {speaker_wav_path}")
-
-        with queue_lock:
-            if last_processed_text and new_text.startswith(last_processed_text):
-                text_to_process = new_text[len(last_processed_text):].strip()
-            else:
-                text_to_process = new_text
-
-            processed_text = preprocess_text(text_to_process)
-            
-            logger.info(f"Text to process after preprocessing: '{processed_text}'")
-            
-            if processed_text:
-                text_buffer += processed_text
-                if len(processed_text.split()) >= MIN_SENTENCE_LENGTH:
-                    sentences = split_into_sentences(processed_text)
-                else:
-                    sentences = [processed_text]
-                
-                logger.info(f"Sentences: {sentences}")
-                for sentence in sentences:
-                    sentence_queue.append((sentence, speaker_wav_path, language))
-
-                correction_flag = False
-                last_processed_text = new_text
-
-        logger.info("Calling process_sentence_queue")
-        process_sentence_queue()
-
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        emit('error', {'error': str(e)})
-
-    if time.time() % MEMORY_CHECK_INTERVAL < 1:
-        check_memory_usage()
-
-def process_sentence_queue():
-    global paused, sentence_queue, correction_flag
-    logger.info(f"Starting process_sentence_queue. Queue length: {len(sentence_queue)}")
-    while sentence_queue:
-        with queue_lock:
-            if correction_flag:
-                logger.info("Correction flag set, breaking loop")
-                break
-            sentence, speaker_wav_path, language = sentence_queue.popleft()
-            logger.info(f"Processing sentence: '{sentence}'")
-
-        if not paused:
-            logger.info("Calling process_text")
-            audio, processing_time, real_time_factor = process_text(sentence, speaker_wav_path, language)
-            logger.info(f"process_text returned. Audio length: {len(audio)}")
-            if len(audio) > 0:
-                buffer = io.BytesIO()
-                sf.write(buffer, audio, SAMPLE_RATE, format='WAV')
-                audio_bytes = buffer.getvalue()
-
-                logger.info("Emitting audio")
-                emit('audio', {
-                    'audio': audio_bytes,
-                    'processing_time': processing_time,
-                    'real_time_factor': real_time_factor
-                }, broadcast=True)
-
-                time.sleep(PROCESSING_DELAY)
-            else:
-                logger.warning("Audio length is 0, not emitting")
-        else:
-            logger.info("Speech generation is paused")
-    logger.info("Finished process_sentence_queue")
+@socketio.on('correction')
+def handle_correction(data):
+    global correction_flag
+    correction_flag = True
+    corrected_text = data['corrected_text']
+    original_text = data['original_text']
+    emit('correction', {'corrected_text': corrected_text, 'original_text': original_text}, broadcast=True)
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000)
