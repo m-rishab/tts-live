@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 import os
 import logging
@@ -41,7 +41,7 @@ MEMORY_CHECK_INTERVAL = 60
 SPEAKERS_FOLDER = "speakers"
 UPLOAD_FOLDER = "uploads"
 TEMPLATE_FOLDER = "templates"
-MIN_SENTENCE_LENGTH = 1  # Changed to 1 to allow shorter inputs
+MIN_SENTENCE_LENGTH = 1
 
 # Create Flask app and SocketIO instance
 app = Flask(__name__, template_folder=TEMPLATE_FOLDER)
@@ -104,7 +104,6 @@ def process_dates(text):
             day_str = f"{day_num}{'th' if 11 <= day_num <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day_num % 10, 'th')}"
             month_str = date.strftime("%B")
             year = date.year
-            # Adjust for two-digit years
             if year < 100:
                 year += 2000 if year <= 24 else 1900  # Adjust this threshold as needed
             year_str = num2words(year)
@@ -125,26 +124,21 @@ def preprocess_text(text):
         return ""
     
     try:
-        # Existing preprocessing steps
         text = re.sub(r'<original_message>.*?</original_message>', '', text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<[^>]+>', '', text)
         text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<function_name>.*?</function_name>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<function_name>.*?</function_name>', '', text)
         text = re.sub(r'<[^>]+>', '', text)
         text = re.sub(r'\b(end_call|start_call|function_name)\b', '', text, flags=re.IGNORECASE)
-        
-        # New step: Remove {prompt} and {response} placeholders
         text = re.sub(r'\{prompt\}|\{response\}', '', text)
-        
         text = process_dates(text)
         text = remove_special_characters(text)
         text = normalize_text(text)
-        
         return text.strip()
     except Exception as e:
         logger.error(f"Error in preprocess_text: {e}")
         return ""
-    
+
 def process_text(text, speaker_wav, language):
     try:
         logger.info(f"Starting process_text with text: '{text}', language: {language}")
@@ -237,13 +231,11 @@ def handle_message(data):
             raise FileNotFoundError(f"Speaker file not found: {speaker_wav_path}")
 
         with queue_lock:
-            # Process only the new text
             if last_processed_text and new_text.startswith(last_processed_text):
                 text_to_process = new_text[len(last_processed_text):].strip()
             else:
                 text_to_process = new_text
 
-            # Preprocess the new text
             processed_text = preprocess_text(text_to_process)
             
             logger.info(f"Text to process after preprocessing: '{processed_text}'")
